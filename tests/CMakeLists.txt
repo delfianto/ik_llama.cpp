@@ -220,3 +220,10 @@ llama_target_and_test(test-autorelease.cpp        LABEL "model")
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
 target_link_libraries(${TEST_TARGET} PRIVATE llama)
+
+llama_target_and_test(test-moe-cache.cpp)
+target_include_directories(test-moe-cache PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/common)
+
+# Requires an external GGUF and explicit cache/placement options; not a CTest default.
+add_executable(test-moe-cache-model test-moe-cache-model.cpp)
+target_link_libraries(test-moe-cache-model PRIVATE common)

@@ -33,6 +33,7 @@ struct llama_cparams {
     bool flash_attn;
     int  mla_attn;
     int  attn_max_batch;
+    size_t moe_cache_size = 0;
     bool fused_moe_up_gate;
     bool grouped_expert_routing;
     bool fused_up_gate;

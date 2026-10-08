@@ -616,6 +616,7 @@ struct llama_model {
 
     std::vector<rpc_device> rpc_servers;
     std::vector<int32_t> devices;
+    std::vector<float> moe_cache_tensor_split; // original explicit weights, empty = query free memory
     std::vector<int32_t> default_layer_device;
     std::vector<float>   aux_buffer;
 

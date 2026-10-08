@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-cparams.h"
+#include "llama-moe-cache.h"
 #include "llama-sampling.h"
 
 #include "llama-spec-features.h"
@@ -360,6 +361,7 @@ struct llama_context {
     std::unordered_map<struct llama_lora_adapter *, float> lora_adapters;
 
     std::vector<ggml_backend_t> backends;
+    std::unique_ptr<llama_moe_cache> moe_cache;
 #ifdef GGML_USE_METAL
     ggml_backend_t backend_metal = nullptr;
 #endif

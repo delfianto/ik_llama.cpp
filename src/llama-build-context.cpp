@@ -1649,6 +1649,27 @@ llm_expert_gating_func_type   gating_op,
         ggml_build_forward_expand(graph, weights);
     }
 
+    ggml_tensor * cache_slots = nullptr;
+    if ((type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU) && lctx.moe_cache && lctx.lora_adapters.empty() && !up_gate_exps && !up_exps_b && !gate_exps_b && !down_exps_b) {
+        auto * map = lctx.moe_cache->get_slot_map(il, selected_experts->ne[1], selected_experts->ne[0]);
+        if (map && lctx.moe_cache->get_experts(up_exps) && lctx.moe_cache->get_experts(gate_exps) && lctx.moe_cache->get_experts(down_exps)) {
+            auto * ids = ggml_is_contiguous(selected_experts) ? selected_experts : ggml_cont(ctx, selected_experts);
+            ids = ggml_reshape_1d(ctx, ids, ggml_nelements(ids));
+            auto * lookup = ggml_get_rows(ctx, map, ids);
+            // Existing scheduler convention: this marker forces a new split.
+            lookup->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = 0xff;
+            auto backend = lctx.moe_cache->backend(il);
+            if (ggml_backend_supports_op(backend, lookup)) {
+                ggml_backend_sched_set_tensor_backend(lctx.sched, lookup, backend);
+                cb(lookup, "ffn_moe_slots", il);
+                cache_slots = ggml_reshape_2d(ctx, lookup, selected_experts->ne[0], selected_experts->ne[1]);
+            }
+        }
+    }
+    auto * expert_ids = cache_slots ? cache_slots : selected_experts;
+    auto * expert_up = cache_slots ? lctx.moe_cache->get_experts(up_exps) : up_exps;
+    auto * expert_gate = cache_slots ? lctx.moe_cache->get_experts(gate_exps) : gate_exps;
+    auto * expert_down = cache_slots ? lctx.moe_cache->get_experts(down_exps) : down_exps;
     cur = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
 
     if (weight_before_ffn) {
@@ -1680,22 +1701,28 @@ llm_expert_gating_func_type   gating_op,
     } else {
     GGML_ASSERT(!up_gate_exps && !up_gate_exps_b);
 
-    if (can_use_fmoe && lctx.cparams.fused_moe_up_gate && up_exps->type == gate_exps->type) {
+    bool cache_fmoe_supported = true;
+    if (cache_slots && can_use_fmoe && lctx.cparams.fused_moe_up_gate && up_exps->type == gate_exps->type) {
+        auto * probe = ggml_moe_up_gate(ctx, expert_up, expert_gate, cur, expert_ids,
+            type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
+        cache_fmoe_supported = ggml_backend_supports_op(lctx.moe_cache->backend(il), probe);
+    }
+    if (can_use_fmoe && cache_fmoe_supported && lctx.cparams.fused_moe_up_gate && up_exps->type == gate_exps->type) {
         if (up_exps_b || gate_exps_b || type_op == LLM_FFN_SWIGLU_OAI) {
             par = ggml_moe_up_gate_ext(ctx, up_exps, gate_exps, cur, selected_experts, up_exps_b, gate_exps_b,
                     type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
                     type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU : GGML_UNARY_OP_SWIGLU_OAI);
         } else {
             GGML_ASSERT(type_op != LLM_FFN_SWIGLU_OAI);
-            par = ggml_moe_up_gate(ctx, up_exps, gate_exps, cur, selected_experts,
+            par = ggml_moe_up_gate(ctx, expert_up, expert_gate, cur, expert_ids,
                     type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
         }
         *(float *)(par->op_params + 1) = lctx.model.swiglu_limit(il, false);
     } else {
-        ggml_tensor * up = llm_build_lora_mm_id(lctx, ctx, up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+        ggml_tensor * up = llm_build_lora_mm_id(lctx, ctx, expert_up, cur, expert_ids); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
-        ggml_tensor * gate = llm_build_lora_mm_id(lctx, ctx, gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+        ggml_tensor * gate = llm_build_lora_mm_id(lctx, ctx, expert_gate, cur, expert_ids); // [n_ff, n_expert_used, n_tokens]
         cb(gate, "ffn_moe_gate", il);
 
         if (graph) {
@@ -1730,7 +1757,7 @@ llm_expert_gating_func_type   gating_op,
     }
     cb(par, "ffn_moe_gate_par", il);
 
-    ggml_tensor * experts = llm_build_lora_mm_id(lctx, ctx, down_exps, par, selected_experts); // [n_embd, n_expert_used, n_tokens]
+    ggml_tensor * experts = llm_build_lora_mm_id(lctx, ctx, expert_down, par, expert_ids); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_b) {

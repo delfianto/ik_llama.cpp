@@ -27,6 +27,7 @@
 #include "ggml.h"
 #include "llama.h"
 #include "common.h"
+#include "moe-cache-args.h"
 #include "ggml-cuda.h"
 #include "ggml-sycl.h"
 
@@ -258,6 +259,7 @@ struct cmd_params {
     std::vector<llama_model_tensor_buft_override> buft_overrides;
     ggml_numa_strategy numa;
     std::string cuda_params;
+    size_t moe_cache_size = 0;
     int reps;
     bool verbose;
     bool warmup;
@@ -309,6 +311,7 @@ static const cmd_params cmd_params_defaults = {
     /* buft_overrides       */ {},
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* cuda_params          */ {},
+    /* moe_cache_size       */ 0,
     /* reps                 */ 5,
     /* verbose              */ false,
     /* warmup               */ true,
@@ -350,6 +353,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -t, --threads <n>                   (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
     printf("  -tgb, --threads-gen-batch <n1,n2>   (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
     printf("  -ngl, --n-gpu-layers <n>            (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
+    printf("  --moe-cache-mib <N>                 total CUDA expert cache MiB (default: 0)\n");
     printf("  --n-cpu-moe <n>                     (default: none)\n");
     printf("  --cpu-affinity                      pin threads to the physical P-cores (hybrid CPUs)\n");
     printf("  -cm, --cpu-mask <mask>              pin threads to CPUs in bitmask (e.g. 0x55, 64 CPUs max)\n");
@@ -510,6 +514,10 @@ bool operator==(const std::vector<llama_model_tensor_buft_override> & lhs, const
 
 static cmd_params parse_cmd_params(int argc, char ** argv) {
     cmd_params params;
+    if (const char * value = std::getenv("LLAMA_ARG_MOE_CACHE_MIB")) {
+        try { params.moe_cache_size = parse_moe_cache_mib(value); }
+        catch (const std::exception & e) { fprintf(stderr, "%s\n", e.what()); exit(1); }
+    }
     std::string arg;
     bool invalid_param = false;
     const std::string arg_prefix = "--";
@@ -895,6 +903,10 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 invalid_param = true;
                 break;
             }
+        } else if (arg == "--moe-cache-mib") {
+            if (++i >= argc) { fprintf(stderr, "missing --moe-cache-mib value\n"); exit(1); }
+            try { params.moe_cache_size = parse_moe_cache_mib(argv[i]); }
+            catch (const std::exception & e) { fprintf(stderr, "%s\n", e.what()); exit(1); }
         } else if (arg == "--n-cpu-moe") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -991,6 +1003,7 @@ struct cmd_params_instance {
     test_kind_type test_kind;
     std::string model;
     int n_prompt;
+    size_t moe_cache_size;
     int n_gen;
     int n_batch;
     int n_ubatch;
@@ -1077,6 +1090,7 @@ struct cmd_params_instance {
     llama_context_params to_llama_cparams() const {
         llama_context_params cparams = llama_context_default_params();
 
+        cparams.moe_cache_size = moe_cache_size;
         cparams.n_ctx = n_prompt + n_gen;
         cparams.n_batch = n_batch;
         cparams.n_ubatch = n_ubatch;
@@ -1135,6 +1149,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .test_kind    = */ TEST_KIND_PP,
                 /* .model        = */ m,
                 /* .n_prompt     = */ n_prompt,
+                /* .moe_cache_size= */ params.moe_cache_size,
                 /* .n_gen        = */ 0,
                 /* .n_batch      = */ nb,
                 /* .n_ubatch     = */ nub,
@@ -1182,6 +1197,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .test_kind    = */ TEST_KIND_TG,
                 /* .model        = */ m,
                 /* .n_prompt     = */ 0,
+                /* .moe_cache_size= */ params.moe_cache_size,
                 /* .n_gen        = */ n_gen,
                 /* .n_batch      = */ nb,
                 /* .n_ubatch     = */ nub,
@@ -1229,6 +1245,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .test_kind    = */ TEST_KIND_PG,
                 /* .model        = */ m,
                 /* .n_prompt     = */ n_pg.first,
+                /* .moe_cache_size= */ params.moe_cache_size,
                 /* .n_gen        = */ n_pg.second,
                 /* .n_batch      = */ nb,
                 /* .n_ubatch     = */ nub,
@@ -1276,6 +1293,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .test_kind    = */ TEST_KIND_GP,
                 /* .model        = */ m,
                 /* .n_prompt     = */ n_gp.first,
+                /* .moe_cache_size= */ params.moe_cache_size,
                 /* .n_gen        = */ n_gp.second,
                 /* .n_batch      = */ nb,
                 /* .n_ubatch     = */ nub,
@@ -1355,6 +1373,7 @@ struct test {
     bool embeddings;
     bool repack = false;
     bool fmoe = false;
+    size_t moe_cache_size = 0;
     bool ger = false;
     bool no_fug = false;
     bool use_thp = false;
@@ -1406,6 +1425,7 @@ struct test {
         muge = inst.muge;
         defer_experts = inst.defer_experts;
         fmoe = inst.fmoe;
+        moe_cache_size = inst.moe_cache_size;
         ger = inst.ger;
         rcache = inst.rcache;
         sas = inst.sas;
@@ -1513,7 +1533,7 @@ struct test {
             field == "model_size" || field == "model_n_params" ||
             field == "n_gpu_layers" || field == "main_gpu" ||
             field == "n_prompt" || field == "n_gen" || field == "mla_attn" || field == "attn_max_batch" ||
-            field == "avg_ns" || field == "stddev_ns" || field == "max_gpu") {
+            field == "avg_ns" || field == "stddev_ns" || field == "max_gpu" || field == "moe_cache_bytes") {
             return INT;
         }
         if (field == "cuda" || field == "vulkan" || field == "metal" ||
@@ -1563,7 +1583,7 @@ struct test {
             std::to_string(main_gpu), std::to_string(no_kv_offload), std::to_string(flash_attn),
             std::to_string(mla_attn), std::to_string(attn_max_batch), ser_to_string(ser), std::to_string(reuse),
             tensor_split_str, std::to_string(use_mmap), std::to_string(embeddings),
-            std::to_string(repack), std::to_string(mqkv), std::to_string(muge), std::to_string(defer_experts), std::to_string(fmoe), std::to_string(ger),
+            std::to_string(repack), std::to_string(mqkv), std::to_string(muge), std::to_string(defer_experts), std::to_string(fmoe), std::to_string(moe_cache_size), std::to_string(ger),
             std::to_string(no_fug), std::to_string(use_thp), std::to_string(no_ooae), std::to_string(rcache), std::to_string(sas),
             std::to_string(max_gpu),
             cuda_params, override_tensor,
@@ -1585,7 +1605,7 @@ struct test {
             "n_threads", "type_k", "type_v",
             "n_gpu_layers", "split_mode",
             "main_gpu", "no_kv_offload", "flash_attn", "mla_attn", "attn_max_batch", "ser", "reuse",
-            "tensor_split", "use_mmap", "embeddings", "repack", "mqkv", "muge", "defer_experts", "fused_moe", "grouped_er",
+            "tensor_split", "use_mmap", "embeddings", "repack", "mqkv", "muge", "defer_experts", "fused_moe", "moe_cache_bytes", "grouped_er",
             "no_fused_up_gate", "use_thp", "no_ooae", "rcache", "sas", "max_gpu", "cuda_params", "override_tensor",
             "n_prompt", "n_gen", "test_time",
             "avg_ns", "stddev_ns",

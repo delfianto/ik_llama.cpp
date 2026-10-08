@@ -494,6 +494,7 @@ extern "C" {
         bool flash_attn;  // whether to use flash attention [EXPERIMENTAL]
         int  mla_attn;    // whether to use MLA attention [EXPERIMENTAL]
         int  attn_max_batch;    // maximum batch size for attention computations [EXPERIMENTAL]
+        size_t moe_cache_size; // total CUDA expert cache bytes per context; zero disables
         bool fused_moe_up_gate; // whether to use fused MoE up/gate op
         bool grouped_expert_routing; // whether to use grouped expert routing (BailingMoeV2 arch)
         bool fused_up_gate;     // whether to use fused up/gate op [EXPERIMENTAL]

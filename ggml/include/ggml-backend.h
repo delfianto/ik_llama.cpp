@@ -208,6 +208,13 @@ extern "C" {
     // Reset all assignments and allocators - must be called before changing the node backends
     GGML_API void                 ggml_backend_sched_reset(ggml_backend_sched_t sched);
 
+    // Called for host weight inputs after non-weight inputs have been copied.
+    // Return true to replace the ordinary input copy. graph is the destination split.
+    typedef bool (*ggml_backend_sched_copy_callback)(ggml_backend_t backend,
+        const struct ggml_tensor * src, struct ggml_tensor * dst, struct ggml_cgraph * graph, void * user_data);
+    GGML_API void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched,
+        ggml_backend_sched_copy_callback callback, void * user_data);
+
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 

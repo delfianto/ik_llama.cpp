@@ -894,6 +894,8 @@ llama_context::~llama_context() {
     kv_self.ckpt.release();
     free_dflash_kv_cache_tensors();
     free_dsv4_cache_tensors();
+    if (sched) ggml_backend_sched_synchronize(sched);
+    moe_cache.reset();
     ggml_backend_sched_free(sched);
 
     for (ggml_backend_t backend : backends) {
@@ -4672,6 +4674,17 @@ static bool llm_load_tensors(
         }
     }
 
+    model.moe_cache_tensor_split.clear();
+    if (tensor_split) {
+        bool explicit_split = false;
+        for (size_t i = 0; i < model.devices.size(); ++i) {
+            if (!std::isfinite(tensor_split[i]) || tensor_split[i] < 0) {
+                throw std::runtime_error("tensor split weights must be finite and nonnegative");
+            }
+            explicit_split |= tensor_split[i] > 0;
+        }
+        if (explicit_split) model.moe_cache_tensor_split.assign(tensor_split, tensor_split + model.devices.size());
+    }
     if (int device_count = model.devices.size(); device_count > 1) {
         bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + device_count, [](float x) { return x == 0.0f; });
         std::vector<float> splits(device_count);
@@ -8835,6 +8848,7 @@ struct llama_context_params llama_context_default_params() {
         /*.flash_attn                  =*/ true,
         /*.mla_attn                    =*/ 3,
         /*.attn_max_batch              =*/ 256,
+        /*.moe_cache_size              =*/ 0,
         /*.fused_moe_up_gate           =*/ true,
         /*.grouped_expert_routing      =*/ false,
         /*.fused_up_gate               =*/ true,
@@ -9335,6 +9349,14 @@ struct llama_context * llama_init_from_model(
     cparams.flash_attn       = params.flash_attn;
     cparams.mla_attn         = params.mla_attn;
     cparams.attn_max_batch   = params.attn_max_batch;
+#ifndef GGML_USE_CUDA
+    if (params.moe_cache_size > 0) {
+        LLAMA_LOG_ERROR("MoE cache requires a CUDA build\n");
+        llama_free(ctx);
+        return nullptr;
+    }
+#endif
+    cparams.moe_cache_size = params.moe_cache_size;
     cparams.fused_moe_up_gate= params.fused_moe_up_gate;
     cparams.grouped_expert_routing = params.grouped_expert_routing;
     cparams.fused_up_gate    = params.fused_up_gate;
@@ -9885,7 +9907,7 @@ struct llama_context * llama_init_from_model(
                 llama_get_device_count(*model) > 1 &&
                 model->n_gpu_layers > (int)model->hparams.n_layer &&
                 model->split_mode == LLAMA_SPLIT_MODE_LAYER &&
-                params.offload_kqv && !model->has_tensor_overrides();
+                params.offload_kqv && !model->has_tensor_overrides() && cparams.moe_cache_size == 0;
 #ifndef GGML_USE_CUDA
             // pipeline parallelism requires support for async compute and events
             // currently this is only implemented in the CUDA backend
@@ -9898,6 +9920,21 @@ struct llama_context * llama_init_from_model(
             }
 
             llama_repack_up_gate_exps(*ctx);
+            if (cparams.moe_cache_size > 0) {
+                try {
+                    if (!model->rpc_servers.empty() || model->reload || cparams.mtp || cparams.mtp_op_type != MTP_OP_NONE)
+                        throw std::runtime_error("MoE cache v1 does not support RPC, hot reload, or MTP/draft operation");
+                    ctx->moe_cache.reset(new llama_moe_cache(*model, ctx->backends, backend_buft, cparams.moe_cache_size));
+                    ggml_backend_sched_set_copy_callback(ctx->sched,
+                        [](ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user) {
+                            return static_cast<llama_context *>(user)->moe_cache->copy(backend, src, dst, graph);
+                        }, ctx);
+                } catch (const std::exception & e) {
+                    LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+                    llama_free(ctx);
+                    return nullptr;
+                }
+            }
 
             // build worst-case graph
             int n_past = cparams.n_ctx - n_tokens;
@@ -13186,6 +13223,10 @@ int32_t llama_decode(
 }
 
 void llama_set_mtp_op_type(llama_context * ctx, llama_mtp_op_type mtp_op_type) {
+    if (ctx->moe_cache && mtp_op_type != MTP_OP_NONE) {
+        LLAMA_LOG_ERROR("MoE cache v1 does not support MTP operation\n");
+        return;
+    }
     ctx->set_mtp_op_type(mtp_op_type);
 }
 

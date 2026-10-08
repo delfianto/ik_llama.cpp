@@ -40,6 +40,8 @@ endif()
 add_library(llama
             ../include/llama.h
             llama.cpp
+            llama-moe-cache.cpp
+            llama-moe-cache.h
             llama-spec-features.cpp
             llama-spec-features-dflash.cpp
             llama-dflash.cpp

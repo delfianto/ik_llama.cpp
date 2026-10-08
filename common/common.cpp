@@ -10,6 +10,7 @@
 #endif
 
 #include "common.h"
+#include "moe-cache-args.h"
 // Change JSON_ASSERT from assert() to GGML_ASSERT:
 #define JSON_ASSERT GGML_ASSERT
 #include "llama-vocab.h"
@@ -967,6 +968,9 @@ bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
     }
 
     common_speculative_finalize_stages(params);
+    if (params.moe_cache_size > 0 && (!params.speculative.stages.empty() || !params.speculative.model.empty())) {
+        throw std::invalid_argument("MoE cache v1 does not support speculative decoding");
+    }
 
     std::string spec_error;
     if (!common_speculative_validate_chain(params.speculative, &spec_error)) {
@@ -978,6 +982,7 @@ bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
 
 void gpt_params_parse_from_env(gpt_params & params) {
     // we only care about server-related params for now
+    if (const char * value = std::getenv("LLAMA_ARG_MOE_CACHE_MIB")) params.moe_cache_size = parse_moe_cache_mib(value);
     get_env("LLAMA_ARG_MODEL",            params.model);
     get_env("LLAMA_ARG_MODEL_URL",        params.model_url);
     get_env("LLAMA_ARG_MODEL_ALIAS",      params.model_alias);
@@ -2350,6 +2355,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.speculative.params = argv[i];
         return true;
     }
+    if (arg == "--moe-cache-mib") {
+        CHECK_ARG
+        params.moe_cache_size = parse_moe_cache_mib(argv[i]);
+        return true;
+    }
     if (arg == "-cmoe" || arg == "--cpu-moe") {
         params.ncmoe = 999;
         //params.tensor_buft_overrides.push_back({strdup("\\.ffn_(up|down|gate|gate_up)_exps\\.weight"), ggml_backend_cpu_buffer_type()});
@@ -3547,6 +3557,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
         options.push_back({ "*",       "-nmm,   --no-mmap",               "do not memory-map model (slower load but may reduce pageouts if not using mlock)" });
     }
     options.push_back({ "*",           "-rtr,   --run-time-repack",      "repack tensors if interleaved variant is available"});
+    options.push_back({ "*", "--moe-cache-mib N", "total CUDA cache MiB for host MoE experts (default: 0, disabled)" });
     options.push_back({ "*",           "-cmoe,  --cpu-moe",              "keep all MoE weights in CPU memory"});
     options.push_back({ "*",           "-ncmoe, --n-cpu-moe N",          "keep MoE weights of the first N layers in CPU memory"});
     options.push_back({ "*",           "-thp,   --transparent-huge-pages", "use transparent huge pages on Linux"});
@@ -4643,6 +4654,7 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.scheduler_async   = params.scheduler_async;
     cparams.min_experts       = params.min_experts;
     cparams.thresh_experts    = params.thresh_experts;
+    cparams.moe_cache_size = params.moe_cache_size;
     cparams.only_active_experts = params.only_active_exps;
     cparams.prefetch_experts  = params.prefetch_experts;
     cparams.prefetch_experts_threads = params.prefetch_experts_threads;
